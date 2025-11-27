@@ -1,0 +1,307 @@
+// Repo: privacy-relayer-starter
+// Type: Node.js (JavaScript)
+// Purpose: Minimal, real, runnable prototype that demonstrates a trustless-ish blind-signature relayer
+// and a simple "note-based" claim flow. This is a starting point for your GitHub repo. 
+// It is intentionally pragmatic: uses RSA blind signatures (for demo), an Express API,
+// an in-memory "on-chain" simulator and ledger, and clear extension points for ZK or MPC.
+// -----------------------------------------------------------------------------
+// Instructions:
+// 1) Save files below as separate files in a project folder.
+// 2) npm install
+// 3) node server.js
+// 4) See endpoints in README section at the end of this big file.
+// -----------------------------------------------------------------------------
+
+// ---------------------------- FILE: package.json -------------------------------
+{
+  "name": "privacy-relayer-starter",
+  "version": "0.1.0",
+  "description": "Prototype: blind-signature relayer + note-based claim flow (demo)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": ["privacy","blind-signature","relayer","zk","mixer","demo"],
+  "author": "Generated for Enes Yıldız",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "body-parser": "^1.20.2",
+    "node-forge": "^1.3.1",
+    "uuid": "^9.0.0"
+  }
+}
+
+// ---------------------------- FILE: server.js ---------------------------------
+// Minimal Express server demonstrating the flows described in the design:
+// - Key generation (simulates relayer operator)
+// - /deposit -> user announces deposit (on-chain simulation)
+// - /get-blind-signature -> user requests blind-signed note token
+// - /submit-withdraw -> user submits claim with unblinded signature
+// The code is intentionally simple and commented for learning and extension.
+
+const express = require('express');
+const bodyParser = require('body-parser');
+const { BlindSigner } = require('./src/blindSig');
+const { Ledger } = require('./src/ledger');
+const { v4: uuidv4 } = require('uuid');
+
+const app = express();
+app.use(bodyParser.json());
+
+// Instantiate in-memory components
+const signer = BlindSigner.create();
+const ledger = new Ledger();
+
+// For demo: admin endpoint to view state (in real product this would be locked!)
+app.get('/_admin/state', (req, res) => {
+  res.json({
+    publicKey: signer.getPublicKeyPem(),
+    deposits: ledger.getDeposits(),
+    spentNotes: ledger.getSpentNotes()
+  });
+});
+
+// 1) Deposit flow (simulated on-chain)
+// Client posts { txHash, from, amount }
+// System records deposit and issues a depositId
+app.post('/deposit', (req, res) => {
+  const { txHash, from, amount } = req.body;
+  if (!txHash || !from || !amount) return res.status(400).json({ error: 'txHash, from, amount required' });
+  const deposit = ledger.recordDeposit({ txHash, from, amount });
+  return res.json({ depositId: deposit.depositId });
+});
+
+// 2) Get blind signature for a *note* (the user proves deposit off-chain or can be any user)
+// Client sends a blindedMessage (base64) and receives a blind signature (base64)
+// This is the critical "blind-signature" endpoint: the server never learns the raw note.
+app.post('/get-blind-signature', async (req, res) => {
+  const { blinded } = req.body;
+  if (!blinded) return res.status(400).json({ error: 'blinded required (base64)' });
+  try {
+    const blindSig = signer.signBlinded(Buffer.from(blinded, 'base64'));
+    return res.json({ blindSig: blindSig.toString('base64') });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// 3) Submit withdraw/claim (user submits unblinded signature + note)
+// Body: { note, signature (base64), targetAddress }
+// Server verifies signature against public key, checks note unused, and executes simulated payout
+app.post('/submit-withdraw', async (req, res) => {
+  const { note, signature, target } = req.body;
+  if (!note || !signature || !target) return res.status(400).json({ error: 'note, signature, target required' });
+
+  const sigBuf = Buffer.from(signature, 'base64');
+  const ok = signer.verify(Buffer.from(note, 'utf8'), sigBuf);
+  if (!ok) return res.status(400).json({ error: 'invalid signature' });
+
+  // Check if note already spent
+  if (ledger.isNoteSpent(note)) return res.status(400).json({ error: 'note already spent' });
+
+  // Mark note as spent and simulate sending funds (create a payout record)
+  ledger.spendNote(note, { target, payoutId: uuidv4(), timestamp: Date.now() });
+
+  return res.json({ status: 'ok', payoutMock: { target, txHash: `mocktx_${Math.random().toString(36).slice(2)}` } });
+});
+
+// 4) Utility endpoint: get relayer public key (for client-side verification or blind creation)
+app.get('/public-key', (req, res) => {
+  res.type('text').send(signer.getPublicKeyPem());
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Privacy relayer demo listening on port ${PORT}`);
+  console.log('Admin state available at GET /_admin/state (demo only)');
+});
+
+// ------------------------- FILE: src/blindSig.js --------------------------------
+// Implements a simple RSA blind-signature flow using node-forge.
+// In production you'd replace this with stronger keys and hardened crypto primitives
+
+const forge = require('node-forge');
+
+class BlindSigner {
+  constructor(privateKey, publicKey) {
+    this.privateKey = privateKey; // forge privateKey
+    this.publicKey = publicKey;   // forge publicKey
+  }
+
+  static create(bits = 2048) {
+    // Generate RSA keypair (synchronous for simplicity)
+    const keys = forge.pki.rsa.generateKeyPair({ bits, e: 0x10001 });
+    return new BlindSigner(keys.privateKey, keys.publicKey);
+  }
+
+  // Return PEM encoded public key
+  getPublicKeyPem() {
+    return forge.pki.publicKeyToPem(this.publicKey);
+  }
+
+  // Server-side blind-sign: accepts blinded message bytes buffer
+  signBlinded(blindedBuf) {
+    // blindedBuf is a Node Buffer; convert
+    const blindedBigInt = new forge.jsbn.BigInteger(forge.util.createBuffer(blindedBuf).toHex(), 16);
+
+    // Use RSA raw private exponentiation: s = blinded^d mod n
+    const n = new forge.jsbn.BigInteger(this.privateKey.n.toString(16), 16);
+    const d = new forge.jsbn.BigInteger(this.privateKey.d.toString(16), 16);
+    const sig = blindedBigInt.modPow(d, n);
+
+    const sigHex = sig.toString(16);
+    return Buffer.from(sigHex, 'hex');
+  }
+
+  // Verify a *regular* signature over message
+  verify(messageBuf, sigBuf) {
+    // For demo we assume signature is raw RSA signature over the message hash (SHA256)
+    const md = forge.md.sha256.create();
+    md.update(messageBuf.toString('binary'));
+    const signatureHex = sigBuf.toString('hex');
+    const signatureBig = new forge.jsbn.BigInteger(signatureHex, 16);
+
+    // Verify via public key: m = sig^e mod n, then compare to expected padded digest
+    // For practical demo, we'll perform verify by using forge's verify with raw signature bytes
+    try {
+      // Convert signature bytes into binary string
+      const sigBinary = forge.util.createBuffer(sigBuf).getBytes();
+      return this.publicKey.verify(md.digest().getBytes(), sigBinary);
+    } catch (e) {
+      // fallback: false
+      return false;
+    }
+  }
+}
+
+module.exports = { BlindSigner };
+
+// ------------------------- FILE: src/ledger.js ----------------------------------
+// Minimal in-memory ledger to simulate deposits and spent notes.
+// Replace with DB (Postgres/Redis) in real project.
+
+class Ledger {
+  constructor() {
+    this.deposits = []; // { depositId, txHash, from, amount, timestamp }
+    this.spentNotes = new Map(); // note -> metadata
+    this._depositCounter = 1;
+  }
+
+  recordDeposit({ txHash, from, amount }) {
+    const deposit = {
+      depositId: `dep_${this._depositCounter++}`,
+      txHash,
+      from,
+      amount,
+      timestamp: Date.now()
+    };
+    this.deposits.push(deposit);
+    return deposit;
+  }
+
+  getDeposits() { return this.deposits.slice(); }
+
+  isNoteSpent(note) { return this.spentNotes.has(note); }
+
+  spendNote(note, meta) { this.spentNotes.set(note, meta); }
+
+  getSpentNotes() { return Array.from(this.spentNotes.entries()).map(([note, m]) => ({ note, meta: m })); }
+}
+
+module.exports = { Ledger };
+
+// --------------------------- FILE: README.md -----------------------------------
+//# privacy-relayer-starter
+
+// Quick overview
+// --------------
+// This repository is a toy prototype to showcase a trust-minimized, blind-signature based relayer.
+// It is NOT production-ready. Use it to bootstrap ideas, tests, and architecture.
+
+// Architecture
+// ------------
+// - The relayer holds an RSA keypair and provides blind-signing service. Clients send blinded notes
+//   and receive blind signatures. The relayer never sees the raw note values.
+// - Users deposit on-chain to show they "funded" the system (simulated in /deposit).
+// - After obtaining an unblinded signature that validates a note, a user can "withdraw" by submitting
+//   the note + signature; the relayer verifies, checks note is unused, and performs a payout.
+// - Money custody in this demo is simulated. Replace with real on-chain bridge logic in production.
+
+// How to run
+// ----------
+// 1) Save three files: server.js, src/blindSig.js, src/ledger.js, package.json
+// 2) npm install
+// 3) node server.js
+// 4) Try the flows below.
+
+// Example flows (curl)
+// --------------------
+// 1) Make a deposit (simulate on-chain):
+// curl -X POST http://localhost:3000/deposit -H 'Content-Type: application/json' -d '{"txHash":"tx123","from":"0xabc","amount":0.1}'
+
+// 2) Client side (demo) creates a "note" and requests blind signature:
+// (Client demo code below provides a step-by-step)
+
+// Client demo (Node.js) - Quick run-through
+// ----------------------------------------
+// This snippet demonstrates how a client would create a blinded note, ask the relayer for signature,
+// unblind it locally, then submit a withdraw.
+
+/*
+const fetch = require('node-fetch');
+const forge = require('node-forge');
+
+(async () => {
+  // 1) Create a note (random secret) and compute message
+  const note = 'note:' + Math.random().toString(36).slice(2);
+
+  // 2) Load relayer public key
+  const pubPem = await (await fetch('http://localhost:3000/public-key')).text();
+  const pub = forge.pki.publicKeyFromPem(pubPem);
+
+  // 3) Create blinding factor and blinded message
+  const mBytes = note; // message
+  const mBig = new forge.jsbn.BigInteger(forge.util.bytesToHex(mBytes), 16);
+  // forge provides a helper for blind but here we'll do a simple pattern using random r
+  const n = new forge.jsbn.BigInteger(pub.n.toString(16), 16);
+  const e = new forge.jsbn.BigInteger(pub.e.toString(16), 16);
+  let r;
+  do { r = new forge.jsbn.BigInteger(forge.util.bytesToHex(forge.random.getBytesSync(32)), 16); } while (r.compareTo(n) >= 0);
+  // Compute blinded = (m * r^e) mod n  -- NOTE: m must be an integer < n, so in practice hash the message
+  const hashed = forge.md.sha256.create(); hashed.update(mBytes);
+  const mHex = hashed.digest().toHex();
+  const mBi = new forge.jsbn.BigInteger(mHex, 16);
+  const rPowE = r.modPow(e, n);
+  const blinded = mBi.multiply(rPowE).mod(n);
+
+  // Send blinded to /get-blind-signature
+  const resp = await fetch('http://localhost:3000/get-blind-signature', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ blinded: Buffer.from(blinded.toString(16), 'hex').toString('base64') }) });
+  const j = await resp.json();
+  const blindSigB64 = j.blindSig;
+  const blindSigBuf = Buffer.from(blindSigB64, 'base64');
+
+  // Unblind: sig = blindSig * r^{-1} mod n
+  const blindSigBig = new forge.jsbn.BigInteger(blindSigBuf.toString('hex'), 16);
+  const rInv = r.modInverse(n);
+  const sigBig = blindSigBig.multiply(rInv).mod(n);
+  const sigHex = sigBig.toString(16);
+  const sigBuf = Buffer.from(sigHex, 'hex');
+
+  // 4) Submit withdraw
+  const withdraw = await fetch('http://localhost:3000/submit-withdraw', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ note, signature: sigBuf.toString('base64'), target: '0xDEST' }) });
+  console.log(await withdraw.json());
+})();
+*/
+
+// Security notes & next steps
+// --------------------------
+// - RSA blind signatures are used here for demonstration only. For stronger privacy, adopt
+//   pairing-based BLS blind signatures or other constructions that have standard ZK-friendly forms.
+// - Integrate with an on-chain bridge or rollup: when users deposit on-chain, mint "note credits"
+//   in a rollup or zk-vault. Withdrawals should trigger real on-chain transfers using relayer-signed
+//   transactions or a multisig set.
+// - Add rate-limits, AML heuristics, and withdrawal limits to protect the relayer (or move to fully
+//   trustless ZK approach where relayer does not custody funds).
+// - Consider MPC or distributed key generation so that no single operator can sign unilaterally.
+
